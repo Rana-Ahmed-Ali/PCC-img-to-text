@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 
 // Use the provided API key as a fallback, but prefer the environment variable
-const API_KEY = process.env.GEMINI_API_KEY || "AIzaSyAOlHhzHW3pHFzuF1awp59fdu2BWA-TE9U";
+const API_KEY = process.env.GEMINI_API_KEY || "";
 
 interface FileItem {
   id: string;
@@ -190,35 +190,53 @@ export default function App() {
 
     setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'processing', error: undefined } : f));
 
-    try {
-      const ai = new GoogleGenAI({ apiKey: API_KEY });
-      const base64Data = file.data.split(',')[1];
+    // List of models to try in order of preference
+    const models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"];
+    let lastError: any = null;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          {
-            parts: [
-              { text: "Extract all numbers from this handwritten image. Return them as a JSON array of strings. Each string should be a single number found in the image. If there are multiple columns, extract them row by row. Only return the JSON array, nothing else." },
-              { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
-            ]
-          }
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING }
-          }
-        }
-      });
+    for (const modelName of models) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: API_KEY });
+        const base64Data = file.data.split(',')[1];
 
-      const result = JSON.parse(response.text || "[]");
-      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, numbers: result, status: 'done' } : f));
-    } catch (err: any) {
-      console.error(err);
-      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'error', error: err.message } : f));
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: [
+            {
+              parts: [
+                { text: "Extract all numbers from this handwritten image. Return them as a JSON array of strings. Each string should be a single number found in the image. If there are multiple columns, extract them row by row. Only return the JSON array, nothing else." },
+                { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
+              ]
+            }
+          ],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          }
+        });
+
+        const result = JSON.parse(response.text || "[]");
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, numbers: result, status: 'done' } : f));
+        return; // Success, exit function
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`Model ${modelName} failed, trying fallback...`, err.message);
+        
+        // If it's a 503 (high demand) or 429 (rate limit), we try the next model
+        const isRetryable = err.message.includes("503") || 
+                           err.message.toLowerCase().includes("demand") || 
+                           err.message.toLowerCase().includes("unavailable") ||
+                           err.message.includes("429") ||
+                           err.message.toLowerCase().includes("limit");
+        
+        if (!isRetryable) break; // If it's a different error (like auth), don't bother trying other models
+      }
     }
+
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'error', error: lastError?.message || "All models are currently busy" } : f));
   };
 
   const processAll = async () => {
