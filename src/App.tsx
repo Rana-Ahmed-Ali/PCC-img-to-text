@@ -3,7 +3,7 @@
  */
 
 
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type } from "@google/genai";
 import { useDropzone } from 'react-dropzone';
 import * as XLSX from 'xlsx';
@@ -24,7 +24,8 @@ import {
   FileText,
   Trash2,
   ChevronRight,
-  Clock
+  Clock,
+  Clipboard
 } from 'lucide-react';
 
 // Use the provided API key as a fallback, but prefer the environment variable
@@ -48,6 +49,65 @@ export default function App() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const handlePaste = useCallback((e: React.ClipboardEvent | ClipboardEvent) => {
+    const items = (e as any).clipboardData?.items;
+    if (!items) return;
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].type.indexOf('image') !== -1) {
+        const file = items[i].getAsFile();
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const newFile: FileItem = {
+              id: Math.random().toString(36).substr(2, 9),
+              data: reader.result as string,
+              name: `Pasted_${new Date().toLocaleTimeString().replace(/:/g, '-')}`,
+              numbers: [],
+              status: 'pending'
+            };
+            setFiles(prev => [...prev, newFile]);
+            setSelectedFileId(newFile.id);
+          };
+          reader.readAsDataURL(file);
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [handlePaste]);
+
+  const pasteFromClipboard = async () => {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const imageTypes = item.types.filter(type => type.startsWith('image/'));
+        for (const type of imageTypes) {
+          const blob = await item.getType(type);
+          const reader = new FileReader();
+          reader.onload = () => {
+            const newFile: FileItem = {
+              id: Math.random().toString(36).substr(2, 9),
+              data: reader.result as string,
+              name: `Clip_${new Date().toLocaleTimeString().replace(/:/g, '-')}`,
+              numbers: [],
+              status: 'pending'
+            };
+            setFiles(prev => [...prev, newFile]);
+            setSelectedFileId(newFile.id);
+          };
+          reader.readAsDataURL(blob);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to read clipboard:", err);
+      alert("Please use Ctrl+V to paste or check clipboard permissions.");
+    }
+  };
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const newFiles = acceptedFiles.map(file => {
@@ -233,19 +293,26 @@ export default function App() {
                 className="w-full pl-10 pr-4 py-2 bg-white border border-neutral-200 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none transition-all text-sm"
               />
             </div>
-            <div className="flex items-center gap-2 w-full sm:w-auto">
+              <div className="flex items-center gap-2 w-full sm:w-auto">
               <button
                 onClick={startCamera}
                 className="flex-1 sm:flex-none px-4 py-2 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50 transition-all flex items-center justify-center gap-2 text-sm font-medium"
               >
                 <Camera className="w-4 h-4 text-green-600" />
-                Camera
+                <span className="hidden sm:inline">Camera</span>
+              </button>
+              <button
+                onClick={pasteFromClipboard}
+                className="flex-1 sm:flex-none px-4 py-2 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50 transition-all flex items-center justify-center gap-2 text-sm font-medium"
+              >
+                <Clipboard className="w-4 h-4 text-green-600" />
+                <span className="hidden sm:inline">Paste</span>
               </button>
               <div {...getRootProps()} className="flex-1 sm:flex-none">
                 <input {...getInputProps()} />
                 <button className="w-full px-4 py-2 bg-green-600 text-white rounded-xl hover:bg-green-700 transition-all flex items-center justify-center gap-2 text-sm font-medium shadow-sm">
                   <Upload className="w-4 h-4" />
-                  Upload
+                  <span className="hidden sm:inline">Upload</span>
                 </button>
               </div>
             </div>
