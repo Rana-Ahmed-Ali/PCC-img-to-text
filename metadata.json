@@ -1,0 +1,5 @@
+{
+  "name": "PCC Handwritten to Excel",
+  "description": "Official handwritten number converter for Punjab Computer College. Developed by Ahmed Ali Rana.",
+  "requestFramePermissions": ["camera"]
+}
