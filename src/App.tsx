@@ -28,8 +28,8 @@ import {
   Clipboard
 } from 'lucide-react';
 
-// Use the provided API key as a fallback, but prefer the environment variable
-const API_KEY = process.env.GEMINI_API_KEY || "";
+// Recommended way: Set VITE_GEMINI_API_KEY in your .env file
+const API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 
 interface FileItem {
   id: string;
