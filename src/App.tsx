@@ -49,6 +49,7 @@ export default function App() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const handlePaste = useCallback((e: React.ClipboardEvent | ClipboardEvent) => {
     const items = (e as any).clipboardData?.items;
@@ -143,33 +144,36 @@ export default function App() {
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setIsCameraOpen(true);
-      }
+      streamRef.current = stream;
+      setIsCameraOpen(true);
     } catch (err) {
+      console.error("Camera access error:", err);
       alert("Could not access camera. Please check permissions.");
     }
   };
 
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-      setIsCameraOpen(false);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
+    setIsCameraOpen(false);
   };
 
   const captureImage = () => {
     if (videoRef.current && canvasRef.current) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
+      
+      // Ensure video is ready
+      if (video.videoWidth === 0 || video.videoHeight === 0) return;
+
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg');
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85); // High quality JPEG
         const newFile: FileItem = {
           id: Math.random().toString(36).substr(2, 9),
           data: dataUrl,
@@ -438,7 +442,18 @@ export default function App() {
                   exit={{ opacity: 0, scale: 0.95 }}
                   className="relative rounded-3xl overflow-hidden bg-black aspect-video shadow-2xl"
                 >
-                  <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" />
+                  <video 
+                    ref={(el) => {
+                      (videoRef as any).current = el;
+                      if (el && streamRef.current) {
+                        el.srcObject = streamRef.current;
+                      }
+                    }} 
+                    autoPlay 
+                    muted 
+                    playsInline 
+                    className="w-full h-full object-cover" 
+                  />
                   <div className="absolute bottom-6 left-0 right-0 flex justify-center items-center gap-4">
                     <button onClick={stopCamera} className="w-12 h-12 bg-white/20 backdrop-blur-md rounded-full flex items-center justify-center text-white hover:bg-white/30 transition-all">
                       <X className="w-6 h-6" />
