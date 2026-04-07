@@ -25,27 +25,45 @@ import {
   Trash2,
   ChevronRight,
   Clock,
-  Clipboard
+  Clipboard,
+  Send,
+  MessageSquare,
+  Copy,
+  Check,
+  ArrowRight
 } from 'lucide-react';
 
 // Recommended way: Set VITE_GEMINI_API_KEY in your .env file
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 
+interface ExtractedNumber {
+  val: string;
+  confidence: number;
+  box_2d?: number[];
+  isVerified?: boolean;
+}
+
 interface FileItem {
   id: string;
   data: string;
   name: string;
-  numbers: string[];
+  numbers: ExtractedNumber[];
   status: 'pending' | 'processing' | 'done' | 'error';
   error?: string;
+  refinementPrompt?: string;
+  processingStep?: string;
 }
 
 export default function App() {
   const [files, setFiles] = useState<FileItem[]>([]);
-  const [schoolName, setSchoolName] = useState('Punjab Computer College');
+  const [schoolName, setSchoolName] = useState('');
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [isCameraOpen, setIsCameraOpen] = useState(false);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
+  const [expectedLength, setExpectedLength] = useState<number>(0);
+  const [progress, setProgress] = useState(0);
+  const [isCopied, setIsCopied] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -66,7 +84,8 @@ export default function App() {
               data: reader.result as string,
               name: `Pasted_${new Date().toLocaleTimeString().replace(/:/g, '-')}`,
               numbers: [],
-              status: 'pending'
+              status: 'pending',
+              refinementPrompt: ''
             };
             setFiles(prev => [...prev, newFile]);
             setSelectedFileId(newFile.id);
@@ -96,7 +115,8 @@ export default function App() {
               data: reader.result as string,
               name: `Clip_${new Date().toLocaleTimeString().replace(/:/g, '-')}`,
               numbers: [],
-              status: 'pending'
+              status: 'pending',
+              refinementPrompt: ''
             };
             setFiles(prev => [...prev, newFile]);
             setSelectedFileId(newFile.id);
@@ -120,7 +140,8 @@ export default function App() {
             data: reader.result as string,
             name: file.name.split('.')[0],
             numbers: [],
-            status: 'pending'
+            status: 'pending',
+            refinementPrompt: ''
           });
         };
         reader.readAsDataURL(file);
@@ -164,7 +185,7 @@ export default function App() {
     if (videoRef.current && canvasRef.current) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      
+
       // Ensure video is ready
       if (video.videoWidth === 0 || video.videoHeight === 0) return;
 
@@ -179,7 +200,8 @@ export default function App() {
           data: dataUrl,
           name: `Capture_${new Date().toLocaleTimeString().replace(/:/g, '-')}`,
           numbers: [],
-          status: 'pending'
+          status: 'pending',
+          refinementPrompt: ''
         };
         setFiles(prev => [...prev, newFile]);
         setSelectedFileId(newFile.id);
@@ -188,14 +210,153 @@ export default function App() {
     }
   };
 
+  const cleanJson = (txt: string) => {
+    const match = txt.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+    return match ? match[0] : txt.replace(/```json|```/g, "").trim();
+  };
+
   const processFile = async (fileId: string) => {
     const file = files.find(f => f.id === fileId);
     if (!file || file.status === 'processing') return;
 
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'processing', processingStep: 'Step 1/3: Initial Scan...', error: undefined } : f));
+
+    const models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+    let lastError: any = null;
+
+    for (const modelName of models) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: API_KEY });
+        const base64Data = file.data.split(',')[1];
+
+        // --- STEP 1: SCAN + COORDINATES ---
+        const response1 = await ai.models.generateContent({
+          model: modelName,
+          contents: [{
+            parts: [
+              {
+                text: `HANDWRITTEN EXTRACTION TASK: 
+                       1. Read all handwritten numbers from the image.
+                       2. Return JSON: { "numbers": [{ "val": "digits", "confidence": 0-100, "box_2d": [ymin,xmin,ymax,xmax] }] }
+                       3. COORDINATES: Return [0-1000] normalized. Use tight horizontal strips.
+                       4. SPECIFIC USER RULES: ${file.refinementPrompt || 'Extract all visible numbers accurately.'}`
+              },
+              { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
+            ]
+          }],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                numbers: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      val: { type: Type.STRING },
+                      confidence: { type: Type.NUMBER },
+                      box_2d: { type: Type.ARRAY, items: { type: Type.NUMBER } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+        const initialResult = JSON.parse(cleanJson(response1.text || "{\"numbers\":[]}")).numbers || [];
+
+        // --- STEP 2: THE "CRITICAL" MICRO-AUDIT ---
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, processingStep: 'Step 2/3: High-Precision Audit...' } : f));
+        const response2 = await ai.models.generateContent({
+          model: modelName,
+          contents: [{
+            parts: [
+              {
+                text: `CRITICAL AUDIT TASK: 
+                       I have an initial extraction: ${JSON.stringify(initialResult.map(n => n.val))}. 
+                       It might contain ERRORS. 
+                       RE-READ the image carefully for each of these items. 
+                       Correct any digit errors. Return ONLY the final JSON array of objects with 'val', 'confidence', and 'box_2d'.`
+              },
+              { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
+            ]
+          }],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  val: { type: Type.STRING },
+                  confidence: { type: Type.NUMBER },
+                  box_2d: { type: Type.ARRAY, items: { type: Type.NUMBER } }
+                }
+              }
+            }
+          }
+        });
+
+        const auditedResult = JSON.parse(cleanJson(response2.text || "[]"));
+        const step2Result = Array.isArray(auditedResult) ? auditedResult : (auditedResult.numbers || initialResult);
+
+        // --- STEP 3: LOGIC SHIELD ---
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, processingStep: 'Step 3/3: Error Correction...' } : f));
+        const response3 = await ai.models.generateContent({
+          model: "gemini-2.5-flash-lite", // Faster for logic/text analysis
+          contents: [{
+            parts: [
+              {
+                text: `LOGIC SHIELD TASK: 
+                       The AI extracted these digits: ${JSON.stringify(step2Result.map(n => n.val))}. 
+                       Scan for OCR patterns: Is a '5' actually an 'S'? Is a '0' actually an 'O'? 
+                       Output ONLY the corrected JSON array of strings for 'val'.`
+              }
+            ]
+          }],
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          }
+        });
+
+        const logicStrings = JSON.parse(cleanJson(response3.text || "[]"));
+        const finalResult = step2Result.map((orig, i) => ({
+          ...orig,
+          val: (Array.isArray(logicStrings) && logicStrings[i]) ? logicStrings[i] : orig.val
+        }));
+
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, numbers: finalResult, status: 'done', processingStep: undefined } : f));
+        return;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`Model ${modelName} failed, trying fallback...`, err.message);
+
+        const isRetryable = err.message.includes("503") ||
+          err.message.toLowerCase().includes("demand") ||
+          err.message.toLowerCase().includes("unavailable") ||
+          err.message.includes("429") ||
+          err.message.toLowerCase().includes("limit");
+
+        if (!isRetryable) break;
+      }
+    }
+
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'error', processingStep: undefined, error: lastError?.message || "Verification failed after 3 attempts" } : f));
+  };
+
+
+  const processRefinement = async (fileId: string) => {
+    const file = files.find(f => f.id === fileId);
+    if (!file || !file.refinementPrompt?.trim() || file.status === 'processing') return;
+
     setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'processing', error: undefined } : f));
 
-    // List of models to try in order of preference
-    const models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"];
+    const models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
     let lastError: any = null;
 
     for (const modelName of models) {
@@ -208,7 +369,11 @@ export default function App() {
           contents: [
             {
               parts: [
-                { text: "Extract all numbers from this handwritten image. Return them as a JSON array of strings. Each string should be a single number found in the image. If there are multiple columns, extract them row by row. Only return the JSON array, nothing else." },
+                {
+                  text: `The user previously extracted these numbers: ${JSON.stringify(file.numbers.map(n => n.val))}. 
+                         Now they have this instruction: "${file.refinementPrompt}". 
+                         Please modify the list as requested. Keep the confidence scores and coordinates if possible. 
+                         Return only the final JSON array of objects with 'val', 'confidence', and 'box_2d'.` },
                 { inlineData: { data: base64Data, mimeType: "image/jpeg" } }
               ]
             }
@@ -217,39 +382,51 @@ export default function App() {
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.ARRAY,
-              items: { type: Type.STRING }
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  val: { type: Type.STRING },
+                  confidence: { type: Type.NUMBER },
+                  box_2d: { type: Type.ARRAY, items: { type: Type.NUMBER } }
+                }
+              }
             }
           }
         });
 
-        const result = JSON.parse(response.text || "[]");
+        const finalResult = JSON.parse(cleanJson(response.text || "[]"));
+        const result = Array.isArray(finalResult) ? finalResult : (finalResult.numbers || file.numbers);
         setFiles(prev => prev.map(f => f.id === fileId ? { ...f, numbers: result, status: 'done' } : f));
-        return; // Success, exit function
+        return;
       } catch (err: any) {
         lastError = err;
-        console.warn(`Model ${modelName} failed, trying fallback...`, err.message);
-        
-        // If it's a 503 (high demand) or 429 (rate limit), we try the next model
-        const isRetryable = err.message.includes("503") || 
-                           err.message.toLowerCase().includes("demand") || 
-                           err.message.toLowerCase().includes("unavailable") ||
-                           err.message.includes("429") ||
-                           err.message.toLowerCase().includes("limit");
-        
-        if (!isRetryable) break; // If it's a different error (like auth), don't bother trying other models
+        const isRetryable = err.message.includes("503") ||
+          err.message.toLowerCase().includes("demand") ||
+          err.message.toLowerCase().includes("unavailable") ||
+          err.message.includes("429") ||
+          err.message.toLowerCase().includes("limit");
+
+        if (!isRetryable) break;
       }
     }
 
-    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'error', error: lastError?.message || "All models are currently busy" } : f));
+    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'error', error: lastError?.message || "Failed to refine refinement" } : f));
   };
 
   const processAll = async () => {
     setIsProcessingAll(true);
+    setProgress(0);
     const pendingFiles = files.filter(f => f.status !== 'done');
+    const total = pendingFiles.length;
+    let count = 0;
+
     for (const file of pendingFiles) {
       await processFile(file.id);
+      count++;
+      setProgress(Math.round((count / total) * 100));
     }
     setIsProcessingAll(false);
+    setTimeout(() => setProgress(0), 2000);
   };
 
   const downloadExcel = (fileId?: string) => {
@@ -262,7 +439,7 @@ export default function App() {
     const baseName = schoolName.trim() || 'Extracted_Numbers';
 
     filesToDownload.forEach(file => {
-      const ws = XLSX.utils.json_to_sheet(file.numbers.map(n => ({ "Number": n })));
+      const ws = XLSX.utils.json_to_sheet(file.numbers.map(n => ({ "Number": n.val, "Confidence": n.confidence })));
       XLSX.utils.book_append_sheet(wb, ws, file.name.substring(0, 30));
     });
 
@@ -281,6 +458,31 @@ export default function App() {
     setFiles(prev => prev.map(f => f.id === id ? { ...f, name: newName } : f));
   };
 
+  const updateNumber = (fileId: string, index: number, newValue: string) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id === fileId) {
+        const newNumbers = [...f.numbers];
+        newNumbers[index] = { ...newNumbers[index], val: newValue, confidence: 100 }; // Manual edit sets confidence to 100
+        return { ...f, numbers: newNumbers };
+      }
+      return f;
+    }));
+  };
+
+  const copyToClipboard = async (content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+    }
+  };
+
+  const updateRefinementPrompt = (id: string, prompt: string) => {
+    setFiles(prev => prev.map(f => f.id === id ? { ...f, refinementPrompt: prompt } : f));
+  };
+
   const selectedFile = files.find(f => f.id === selectedFileId);
 
   return (
@@ -289,9 +491,9 @@ export default function App() {
         <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
             <div className="w-16 h-16 bg-white rounded-full flex items-center justify-center shadow-md border border-neutral-100 overflow-hidden">
-              <img 
-                src="/pcc_logo.png" 
-                alt="PCC Logo" 
+              <img
+                src="/pcc_logo.png"
+                alt="PCC Logo"
                 className="w-full h-full object-contain p-1"
                 onError={(e) => {
                   (e.target as HTMLImageElement).src = "https://ui-avatars.com/api/?name=PCC&background=009639&color=fff";
@@ -315,7 +517,24 @@ export default function App() {
                 className="w-full pl-10 pr-4 py-2 bg-white border border-neutral-200 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none transition-all text-sm"
               />
             </div>
-              <div className="flex items-center gap-2 w-full sm:w-auto">
+
+            <div className="relative w-full sm:w-48">
+              <Phone className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+              <input
+                type="number"
+                placeholder="Expected Digits..."
+                value={expectedLength || ''}
+                onChange={(e) => setExpectedLength(parseInt(e.target.value) || 0)}
+                className="w-full pl-10 pr-4 py-2 bg-white border border-neutral-200 rounded-xl focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none transition-all text-sm"
+              />
+              {expectedLength > 0 && (
+                <div className="absolute -top-2 -right-2 bg-green-100 text-green-700 text-[10px] px-2 py-0.5 rounded-full font-bold border border-green-200">
+                  Fixed
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 w-full sm:w-auto">
               <button
                 onClick={startCamera}
                 className="flex-1 sm:flex-none px-4 py-2 bg-white border border-neutral-200 rounded-xl hover:bg-neutral-50 transition-all flex items-center justify-center gap-2 text-sm font-medium"
@@ -340,6 +559,25 @@ export default function App() {
             </div>
           </div>
         </header>
+
+        {isProcessingAll && (
+          <div className="mb-6 bg-white p-4 rounded-2xl border border-green-100 shadow-sm animate-in fade-in slide-in-from-top-4 duration-300">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-bold text-green-700 flex items-center gap-2">
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Processing all files...
+              </span>
+              <span className="text-xs font-bold text-green-600">{progress}%</span>
+            </div>
+            <div className="w-full h-1.5 bg-neutral-100 rounded-full overflow-hidden">
+              <motion.div
+                className="h-full bg-green-600"
+                initial={{ width: 0 }}
+                animate={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+        )}
 
         <main className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Sidebar: File List */}
@@ -390,7 +628,7 @@ export default function App() {
                           <div className="flex items-center gap-2 mt-0.5">
                             {file.status === 'processing' ? (
                               <span className="text-[10px] text-green-600 flex items-center gap-1">
-                                <Loader2 className="w-2.5 h-2.5 animate-spin" /> Processing
+                                <Loader2 className="w-2.5 h-2.5 animate-spin" /> {file.processingStep || 'Processing'}
                               </span>
                             ) : file.status === 'done' ? (
                               <span className="text-[10px] text-green-700 flex items-center gap-1">
@@ -442,17 +680,17 @@ export default function App() {
                   exit={{ opacity: 0, scale: 0.95 }}
                   className="relative rounded-3xl overflow-hidden bg-black aspect-video shadow-2xl"
                 >
-                  <video 
+                  <video
                     ref={(el) => {
                       (videoRef as any).current = el;
                       if (el && streamRef.current) {
                         el.srcObject = streamRef.current;
                       }
-                    }} 
-                    autoPlay 
-                    muted 
-                    playsInline 
-                    className="w-full h-full object-cover" 
+                    }}
+                    autoPlay
+                    muted
+                    playsInline
+                    className="w-full h-full object-cover"
                   />
                   <div className="absolute bottom-6 left-0 right-0 flex justify-center items-center gap-4">
                     <button onClick={stopCamera} className="w-12 h-12 bg-white/20 backdrop-blur-md rounded-full flex items-center justify-center text-white hover:bg-white/30 transition-all">
@@ -472,42 +710,78 @@ export default function App() {
                   className="bg-white rounded-3xl border border-neutral-200 overflow-hidden shadow-sm"
                 >
                   <div className="p-6 flex flex-col md:flex-row gap-8">
-                    <div className="w-full md:w-1/2 space-y-4">
-                      <div className="relative aspect-[3/4] rounded-2xl overflow-hidden bg-neutral-100 border border-neutral-100">
-                        <img src={selectedFile.data} alt="" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
+                    {/* Left Column: Image Preview */}
+                    <div className="w-full md:w-1/2 flex flex-col gap-4">
+                      <div className="relative aspect-[3/4] rounded-2xl overflow-hidden bg-neutral-100 border border-neutral-100 group">
+                        <img
+                          src={selectedFile.data}
+                          alt="Document Preview"
+                          className="w-full h-full object-contain"
+                          referrerPolicy="no-referrer"
+                        />
                       </div>
 
                       {selectedFile.status !== 'done' && selectedFile.status !== 'processing' && (
                         <button
                           onClick={() => processFile(selectedFile.id)}
-                          className="w-full py-4 bg-green-600 text-white rounded-2xl font-semibold shadow-lg shadow-green-100 hover:bg-green-700 transition-all flex items-center justify-center gap-2"
+                          className="w-full py-4 bg-green-600 text-white rounded-2xl font-semibold shadow-lg shadow-green-100 hover:bg-green-700 transition-all flex items-center justify-center gap-2 group"
                         >
-                          <RefreshCw className="w-5 h-5" />
-                          Extract Numbers
+                          <RefreshCw className="w-5 h-5 group-hover:rotate-180 transition-transform duration-500" />
+                          {selectedFile.refinementPrompt?.trim() ? "Extract with AI Chat Rules" : "Extract Numbers"}
                         </button>
                       )}
                     </div>
 
+                    {/* Right Column: Numbers List & Tools */}
                     <div className="w-full md:w-1/2 flex flex-col">
                       <div className="flex items-center justify-between mb-4">
                         <h3 className="font-bold text-lg flex items-center gap-2">
                           <Hash className="w-5 h-5 text-green-600" />
                           {selectedFile.name}
                         </h3>
+                        <button
+                          onClick={() => processFile(selectedFile.id)}
+                          disabled={selectedFile.status === 'processing'}
+                          className="p-2 text-neutral-400 hover:text-green-600 transition-all hover:bg-green-50 rounded-lg flex items-center gap-2 text-xs font-bold"
+                          title="Reprocess Image"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${selectedFile.status === 'processing' ? 'animate-spin' : ''}`} />
+                          Reprocess
+                        </button>
                       </div>
 
-                      <div className="flex-grow bg-neutral-50 rounded-2xl border border-neutral-100 p-4 min-h-[300px] max-h-[400px] overflow-y-auto">
+                      <div className="flex-grow bg-neutral-50 rounded-2xl border border-neutral-100 p-4 min-h-[300px] max-h-[500px] overflow-y-auto">
                         {selectedFile.status === 'processing' ? (
                           <div className="h-full flex flex-col items-center justify-center text-neutral-400 space-y-3">
                             <Loader2 className="w-8 h-8 animate-spin text-green-600" />
-                            <p className="text-sm font-medium animate-pulse">Reading handwriting...</p>
+                            <p className="text-sm font-medium animate-pulse text-green-600">
+                              {selectedFile.processingStep || 'Reading handwriting...'}
+                            </p>
                           </div>
                         ) : selectedFile.status === 'done' ? (
                           <div className="grid grid-cols-1 gap-2">
                             {selectedFile.numbers.map((num, i) => (
-                              <div key={i} className="bg-white p-3 rounded-xl border border-neutral-100 flex items-center gap-3 shadow-sm">
-                                <span className="text-xs text-neutral-300 font-mono w-4">{i + 1}</span>
-                                <span className="font-mono text-neutral-700">{num}</span>
+                              <div
+                                key={i}
+                                className={`group bg-white p-2 rounded-xl border-2 flex items-center gap-3 shadow-sm transition-all ${focusedIndex === i ? 'border-green-500 ring-4 ring-green-50' : 'border-neutral-50 hover:border-neutral-200'} ${num.confidence < 90 ? 'bg-yellow-50/50' : ''}`}
+                              >
+                                <span className={`text-[10px] font-mono w-4 pl-1 ${focusedIndex === i ? 'text-green-600 font-bold' : 'text-neutral-300'}`}>{i + 1}</span>
+                                <input
+                                  type="text"
+                                  value={num.val}
+                                  onFocus={() => setFocusedIndex(i)}
+                                  onBlur={() => setFocusedIndex(null)}
+                                  onChange={(e) => updateNumber(selectedFile.id, i, e.target.value)}
+                                  className="flex-grow bg-transparent border-none p-1 text-sm font-mono text-neutral-700 focus:ring-0"
+                                />
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {num.confidence < 90 && (
+                                    <div className="text-[9px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded-lg font-bold border border-yellow-200 flex items-center gap-1">
+                                      <AlertCircle className="w-2 h-2" />
+                                      Review
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             ))}
                           </div>
@@ -525,15 +799,53 @@ export default function App() {
                         )}
                       </div>
 
-                      {selectedFile.status === 'done' && (
-                        <div className="mt-6">
-                          <button
-                            onClick={() => downloadExcel(selectedFile.id)}
-                            className="w-full py-4 bg-green-600 text-white rounded-2xl font-semibold shadow-lg shadow-green-100 hover:bg-green-700 transition-all flex items-center justify-center gap-2"
-                          >
-                            <Download className="w-5 h-5" />
-                            Download This File
-                          </button>
+                      {(selectedFile.status === 'done' || selectedFile.status === 'pending') && (
+                        <div className="mt-6 space-y-4">
+                          <div className="bg-green-50/50 p-4 rounded-2xl border border-green-100/50 relative overflow-hidden group">
+                            <div className="absolute top-0 right-0 p-2 opacity-5">
+                              <MessageSquare className="w-12 h-12 text-green-600" />
+                            </div>
+                            <label className="text-[10px] font-bold text-green-700 uppercase tracking-wider mb-2 block flex items-center gap-1">
+                              <MessageSquare className="w-3 h-3" />
+                              Refine Extraction (AI Chat)
+                            </label>
+                            <div className="relative">
+                              <input
+                                type="text"
+                                placeholder={selectedFile.status === 'pending' ? "Tell AI how to extract e.g. 'only numbers with 10 digits'..." : "e.g. 'remove - from these numbers'..."}
+                                value={selectedFile.refinementPrompt || ''}
+                                onChange={(e) => updateRefinementPrompt(selectedFile.id, e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && (selectedFile.status === 'done' ? processRefinement(selectedFile.id) : processFile(selectedFile.id))}
+                                className="w-full pl-4 pr-12 py-3 bg-white border border-green-200 rounded-xl focus:ring-2 focus:ring-green-500 outline-none transition-all text-sm"
+                              />
+                              <button
+                                onClick={() => selectedFile.status === 'done' ? processRefinement(selectedFile.id) : processFile(selectedFile.id)}
+                                disabled={!selectedFile.refinementPrompt?.trim() || selectedFile.status === 'processing'}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-all"
+                              >
+                                {selectedFile.status === 'pending' ? <ArrowRight className="w-4 h-4" /> : <Send className="w-4 h-4" />}
+                              </button>
+                            </div>
+                          </div>
+
+                          {selectedFile.status === 'done' && (
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => copyToClipboard(selectedFile.numbers.map(n => n.val).join('\n'))}
+                                className="flex-1 py-4 bg-white border-2 border-green-600 text-green-700 rounded-2xl font-bold hover:bg-green-50 transition-all flex items-center justify-center gap-2"
+                              >
+                                {isCopied ? <Check className="w-5 h-5" /> : <Copy className="w-5 h-5" />}
+                                {isCopied ? 'Copied!' : 'Copy All'}
+                              </button>
+                              <button
+                                onClick={() => downloadExcel(selectedFile.id)}
+                                className="flex-[2] py-4 bg-green-600 text-white rounded-2xl font-semibold shadow-lg shadow-green-100 hover:bg-green-700 transition-all flex items-center justify-center gap-2"
+                              >
+                                <Download className="w-5 h-5" />
+                                Download (Excel)
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -550,7 +862,7 @@ export default function App() {
         </main>
 
         <footer className="mt-12 text-center text-neutral-400 text-xs flex flex-col items-center justify-center gap-2">
-          <p className="font-medium text-neutral-500">Developed with ❤️ by <span className="text-green-600 font-extrabold uppercase tracking-wider">Ahmed Ali Rana</span></p>
+          <p className="font-medium text-neutral-500">Developed with by <span className="text-green-600 font-extrabold uppercase tracking-wider">Ahmed Ali Rana</span></p>
           <div className="text-[10px] opacity-50">© {new Date().getFullYear()} All Rights Reserved</div>
         </footer>
       </div>
